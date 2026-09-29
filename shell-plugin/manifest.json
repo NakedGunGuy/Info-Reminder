@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "perko.info-reminder",
+  "name": "Information ledger",
+  "version": "1.0.0",
+  "author": "Klemen Perko",
+  "license": "MIT",
+  "description": "What you asked for, what you owe, and what came back. A pill showing who has the ball, with a popup to chase, receive and close items. Backed by the `ir` CLI so Claude Code and the bar share one ledger.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Information ledger",
+    "description": "Outstanding requests and what you owe, with inline chase/receive actions.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,1236 @@
+#!/usr/bin/env python3
+"""ir — the information ledger.
+
+Tracks the state of every thing you are waiting on, and every thing someone
+is waiting on from you. Answers the two questions that actually cost time:
+
+    "did I already ask for this?"      -> state + sent_at
+    "did they already give it to me?"  -> state + got_at
+
+One JSON file, three faces: this CLI (Claude drives it), the omarchy bar
+pill (you glance at it), and `ir tui` (you sit in it).
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import random
+import re
+import shutil
+import string
+import sys
+import tempfile
+from datetime import date, datetime, timedelta
+
+# ---------------------------------------------------------------- storage
+
+LEDGER = os.environ.get(
+    "IR_LEDGER",
+    os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+        "info-reminder",
+        "ledger.json",
+    ),
+)
+
+SCHEMA = 1
+
+# Directions. `in` = they owe me. `out` = I owe them.
+DIRS = ("in", "out")
+
+# One state machine for both directions; the labels differ, the shape does not.
+#   open      nothing has left my hands yet
+#   pending   it has been sent, the other side has the ball
+#   answered  the thing came back / went out, needs a final look
+#   done      closed
+#   blocked   stuck on something else
+#   dropped   abandoned, kept for the record
+STATES = ("open", "pending", "answered", "done", "blocked", "dropped")
+LIVE_STATES = ("open", "pending", "answered", "blocked")
+CLOSED_STATES = ("done", "dropped")
+
+DEFAULT_NUDGE = 3  # days of silence before an item starts asking to be chased
+
+
+def now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def iso(dt: datetime | None) -> str | None:
+    return dt.isoformat(timespec="seconds") if dt else None
+
+
+def parse_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.astimezone()
+
+
+def empty_ledger() -> dict:
+    return {"version": SCHEMA, "items": []}
+
+
+def load() -> dict:
+    try:
+        with open(LEDGER, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return empty_ledger()
+    except json.JSONDecodeError as exc:
+        die(f"ledger is not valid JSON ({exc}); refusing to touch it.\n  {LEDGER}")
+    if not isinstance(data, dict) or "items" not in data:
+        die(f"ledger has an unexpected shape; refusing to touch it.\n  {LEDGER}")
+    return data
+
+
+def save(data: dict) -> None:
+    """Atomic replace, plus a lock so the CLI and a TUI never interleave."""
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    lock_path = LEDGER + ".lock"
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(LEDGER), prefix=".ledger.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+                fh.write("\n")
+            os.replace(tmp, LEDGER)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+
+def new_id(data: dict) -> str:
+    taken = {it["id"] for it in data["items"]}
+    alphabet = string.ascii_lowercase + string.digits
+    while True:
+        cand = "".join(random.choice(alphabet) for _ in range(3))
+        if cand not in taken and not cand.isdigit():
+            return cand
+
+
+# ---------------------------------------------------------------- model
+
+def blank_item(data: dict) -> dict:
+    return {
+        "id": new_id(data),
+        "title": "",
+        "dir": "in",
+        "person": "",
+        "channel": "",
+        "state": "open",
+        "task": "",       # ClickUp task id
+        "thread": "",     # mail message-id / slack permalink / any url
+        "project": "",
+        "tags": [],
+        "created": iso(now()),
+        "sent_at": None,  # when the request (in) or deliverable (out) went out
+        "chases": [],     # timestamps of every nudge
+        "got_at": None,   # when the answer came back
+        "closed_at": None,
+        "due": None,      # YYYY-MM-DD
+        "nudge": DEFAULT_NUDGE,
+        "needs": [],    # the named pieces this item is actually made of
+        "notes": [],
+    }
+
+
+def find(data: dict, ident: str) -> dict:
+    ident = ident.strip().lstrip("#")
+    exact = [it for it in data["items"] if it["id"] == ident]
+    if exact:
+        return exact[0]
+    low = ident.lower()
+    hits = [it for it in data["items"] if low in it["title"].lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die(f"no item matches {ident!r}. `ir list` to see them.")
+    die(
+        f"{ident!r} matches {len(hits)} items; use an id:\n"
+        + "\n".join(f"  {h['id']}  {h['title']}" for h in hits[:10])
+    )
+
+
+# ---------------------------------------------------------------- checklist
+#
+# An item is often not one fact but several: "server access" really means host,
+# user, password, port. Naming them up front turns the vague question "did they
+# answer?" into a checkable one — "which of these five did they send?" — which
+# is both safer to automate and the thing you paste into a chase mail.
+
+def make_need(label: str) -> dict:
+    return {"label": label.strip(), "got": False, "value": "", "at": None, "auto": False}
+
+
+def needs_of(item: dict) -> list:
+    return item.get("needs") or []
+
+
+def needs_got(item: dict) -> list:
+    return [n for n in needs_of(item) if n.get("got")]
+
+
+def needs_missing(item: dict) -> list:
+    return [n for n in needs_of(item) if not n.get("got")]
+
+
+def needs_progress(item: dict) -> str:
+    total = len(needs_of(item))
+    return f"{len(needs_got(item))}/{total}" if total else ""
+
+
+def find_need(item: dict, fragment: str) -> dict:
+    """Match a sub-item by index (1-based) or by a fragment of its label."""
+    items = needs_of(item)
+    if not items:
+        die(f"{item['id']} has no checklist. Add one with `ir need {item['id']} \"...\"`.")
+    frag = fragment.strip()
+    if frag.isdigit():
+        idx = int(frag) - 1
+        if 0 <= idx < len(items):
+            return items[idx]
+        die(f"{item['id']} has {len(items)} checklist entries; {frag} is out of range.")
+    low = frag.lower()
+    hits = [n for n in items if low in n["label"].lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die(f"nothing in {item['id']}'s checklist matches {fragment!r}.")
+    die(
+        f"{fragment!r} matches {len(hits)} entries; use its number:\n"
+        + "\n".join(f"  {needs_of(item).index(h) + 1}. {h['label']}" for h in hits)
+    )
+
+
+def sync_state_to_needs(item: dict) -> None:
+    """A fully-ticked checklist means the information is in; a partial one
+    means it is still outstanding, however many pieces have landed."""
+    needs = needs_of(item)
+    if not needs or item["state"] in CLOSED_STATES or item["state"] == "blocked":
+        return
+    if not needs_missing(item):
+        if item["state"] != "answered":
+            item["state"] = "answered"
+            item["got_at"] = item.get("got_at") or iso(now())
+    elif item["state"] == "answered":
+        # A need was added or un-ticked after the fact — it is outstanding again.
+        item["state"] = "pending" if item.get("sent_at") else "open"
+        item["got_at"] = None
+
+
+def last_contact(item: dict) -> datetime | None:
+    stamps = [parse_dt(item.get("sent_at"))]
+    stamps += [parse_dt(c) for c in item.get("chases", [])]
+    stamps = [s for s in stamps if s]
+    return max(stamps) if stamps else None
+
+
+def days_since(dt: datetime | None) -> int | None:
+    if not dt:
+        return None
+    return (now() - dt).days
+
+
+def due_date(item: dict) -> date | None:
+    raw = item.get("due")
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def attention(item: dict) -> str | None:
+    """Why this item wants a human right now — or None if it can wait."""
+    if item["state"] in CLOSED_STATES:
+        return None
+
+    d = due_date(item)
+    if d:
+        over = (date.today() - d).days
+        if over > 0:
+            return f"overdue {over}d"
+        if over == 0:
+            return "due today"
+
+    if item["state"] == "answered":
+        return "answer in — close it out"
+
+    missing = needs_missing(item) if needs_of(item) else []
+    if missing and needs_got(item):
+        # Something arrived but not everything — the most actionable state there
+        # is, and the one that silently rots without being named.
+        return f"partial — missing {len(missing)} of {len(needs_of(item))}"
+
+    if item["state"] == "open":
+        age = days_since(parse_dt(item.get("created")))
+        if item["dir"] == "out":
+            return "you owe this" if (age or 0) >= 1 else None
+        return "never asked" if (age or 0) >= 1 else None
+
+    if item["state"] == "pending":
+        quiet = days_since(last_contact(item))
+        nudge = item.get("nudge") or DEFAULT_NUDGE
+        if quiet is not None and quiet >= nudge:
+            return f"silent {quiet}d"
+
+    return None
+
+
+def label(item: dict) -> str:
+    """Direction-aware plain English for the current state."""
+    who = item.get("person") or "someone"
+    d, s = item["dir"], item["state"]
+    if s == "done":
+        return "done"
+    if s == "dropped":
+        return "dropped"
+    if s == "blocked":
+        return "blocked"
+    prog = needs_progress(item)
+    suffix = f" ({prog})" if prog else ""
+    if d == "in":
+        return {
+            "open": "not asked yet" + suffix,
+            "pending": f"waiting on {who}" + suffix,
+            "answered": "they answered" + suffix,
+        }[s]
+    return {
+        "open": f"you owe {who}",
+        "pending": f"sent to {who}",
+        "answered": "delivered",
+    }[s]
+
+
+def enrich(item: dict) -> dict:
+    """Item plus everything derived — what the bar, TUI and Claude all read."""
+    out = dict(item)
+    lc = last_contact(item)
+    out["label"] = label(item)
+    out["attention"] = attention(item)
+    out["quiet_days"] = days_since(lc)
+    out["age_days"] = days_since(parse_dt(item.get("created")))
+    out["chase_count"] = len(item.get("chases", []))
+    out["last_contact"] = iso(lc)
+    out["live"] = item["state"] not in CLOSED_STATES
+    out["needs"] = needs_of(item)
+    out["needs_total"] = len(needs_of(item))
+    out["needs_got"] = len(needs_got(item))
+    out["needs_missing"] = [n["label"] for n in needs_missing(item)]
+    out["progress"] = needs_progress(item)
+    return out
+
+
+def counts(items: list[dict]) -> dict:
+    live = [enrich(i) for i in items if i["state"] not in CLOSED_STATES]
+    return {
+        # they have the ball
+        "theirs": sum(1 for i in live if i["dir"] == "in" and i["state"] == "pending"),
+        # I have the ball
+        "mine": sum(
+            1
+            for i in live
+            if (i["dir"] == "in" and i["state"] in ("open", "answered"))
+            or (i["dir"] == "out" and i["state"] in ("open", "pending"))
+        ),
+        "hot": sum(1 for i in live if i["attention"]),
+        "blocked": sum(1 for i in live if i["state"] == "blocked"),
+        "live": len(live),
+    }
+
+
+# ---------------------------------------------------------------- input parsing
+
+REL = re.compile(r"^\+?(\d+)\s*([dwm])$", re.I)
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def parse_due(s: str | None) -> str | None:
+    """Accepts 2026-10-05, 3d, 2w, today, tomorrow, fri, or '' to clear."""
+    if s is None:
+        return None
+    s = s.strip().lower()
+    if s in ("", "none", "clear", "-"):
+        return ""
+    today = date.today()
+    if s == "today":
+        return today.isoformat()
+    if s in ("tomorrow", "tmr"):
+        return (today + timedelta(days=1)).isoformat()
+    m = REL.match(s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        days = {"d": 1, "w": 7, "m": 30}[unit] * n
+        return (today + timedelta(days=days)).isoformat()
+    if s[:3] in WEEKDAYS:
+        target = WEEKDAYS.index(s[:3])
+        ahead = (target - today.weekday()) % 7 or 7
+        return (today + timedelta(days=ahead)).isoformat()
+    try:
+        return date.fromisoformat(s).isoformat()
+    except ValueError:
+        die(f"can't read {s!r} as a date. Try 3d, 2w, fri, tomorrow or 2026-10-05.")
+
+
+def note(item: dict, text: str) -> None:
+    if text:
+        item.setdefault("notes", []).append({"at": iso(now()), "text": text})
+
+
+# ---------------------------------------------------------------- output
+
+def tty() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if tty() else s
+
+
+DIM, BOLD = "2", "1"
+RED, YELLOW, GREEN, BLUE, MAGENTA, CYAN = "31", "33", "32", "34", "35", "36"
+
+
+def die(msg: str) -> None:
+    print(c(RED, "error: ") + msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def state_mark(item: dict) -> str:
+    return {
+        "open": c(YELLOW, "[ ]"),
+        "pending": c(BLUE, "[~]"),
+        "answered": c(GREEN, "[!]"),
+        "done": c(DIM, "[x]"),
+        "blocked": c(RED, "[/]"),
+        "dropped": c(DIM, "[-]"),
+    }[item["state"]]
+
+
+def render(items: list[dict], show_notes: bool = False) -> None:
+    if not items:
+        print(c(DIM, "  nothing here."))
+        return
+    width = shutil.get_terminal_size((100, 24)).columns
+    for it in items:
+        e = enrich(it)
+        head = f"  {state_mark(it)} {c(BOLD, e['id'])}  {e['title']}"
+        print(head[: width + 40])
+
+        bits = [c(CYAN, e["label"])]
+        if e["chase_count"]:
+            bits.append(f"chased {e['chase_count']}x")
+        if e["quiet_days"] is not None and e["state"] == "pending":
+            bits.append(f"quiet {e['quiet_days']}d")
+        if e["due"]:
+            bits.append(f"due {e['due']}")
+        if e["task"]:
+            bits.append(c(MAGENTA, f"CU-{e['task']}"))
+        if e["channel"]:
+            bits.append(e["channel"])
+        if e["project"]:
+            bits.append(c(DIM, e["project"]))
+        if e["tags"]:
+            bits.append(c(DIM, " ".join("#" + t for t in e["tags"])))
+        print("      " + c(DIM, " · ".join(bits)))
+
+        if e["attention"]:
+            print("      " + c(RED, "→ " + e["attention"]))
+        if show_notes:
+            for n in e.get("notes", []):
+                stamp = (n["at"] or "")[:10]
+                print("      " + c(DIM, f"· {stamp} {n['text']}"))
+
+
+def print_summary(data: dict) -> None:
+    n = counts(data["items"])
+    print(
+        c(DIM, "  ")
+        + c(BLUE, f"{n['theirs']} waiting on them")
+        + c(DIM, " · ")
+        + c(YELLOW, f"{n['mine']} on you")
+        + c(DIM, " · ")
+        + c(RED, f"{n['hot']} need action")
+    )
+
+
+# ---------------------------------------------------------------- filtering
+
+def select(data: dict, args) -> list[dict]:
+    items = data["items"]
+
+    if getattr(args, "all", False):
+        pass
+    elif getattr(args, "state", None):
+        items = [i for i in items if i["state"] == args.state]
+    else:
+        items = [i for i in items if i["state"] not in CLOSED_STATES]
+
+    if getattr(args, "person", None):
+        p = args.person.lower()
+        items = [i for i in items if p in (i.get("person") or "").lower()]
+    if getattr(args, "dir", None):
+        items = [i for i in items if i["dir"] == args.dir]
+    if getattr(args, "tag", None):
+        items = [i for i in items if args.tag.lstrip("#") in i.get("tags", [])]
+    if getattr(args, "project", None):
+        pr = args.project.lower()
+        items = [i for i in items if pr in (i.get("project") or "").lower()]
+    if getattr(args, "task", None):
+        items = [i for i in items if i.get("task") == args.task.lstrip("#")]
+    if getattr(args, "hot", False):
+        items = [i for i in items if attention(i)]
+    if getattr(args, "grep", None):
+        g = args.grep.lower()
+        items = [
+            i
+            for i in items
+            if g in i["title"].lower()
+            or any(g in n["text"].lower() for n in i.get("notes", []))
+        ]
+
+    def sort_key(i):
+        e = enrich(i)
+        d = due_date(i)
+        return (
+            0 if e["attention"] else 1,
+            d.toordinal() if d else 10**7,
+            -(e["quiet_days"] or 0),
+            i["title"].lower(),
+        )
+
+    return sorted(items, key=sort_key)
+
+
+def guess_project() -> str:
+    """Repo name of the cwd, so items remember which job they came from."""
+    cur = os.getcwd()
+    while True:
+        if os.path.isdir(os.path.join(cur, ".git")):
+            return os.path.basename(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_add(data, args):
+    it = blank_item(data)
+    it["title"] = " ".join(args.title).strip()
+    if not it["title"]:
+        die("an item needs a title.")
+    it["dir"] = "out" if args.owe else "in"
+    it["person"] = (args.person or "").strip()
+    it["channel"] = (args.channel or "").strip()
+    it["task"] = (args.task or "").lstrip("#").strip()
+    it["thread"] = (args.thread or "").strip()
+    it["project"] = (args.project if args.project is not None else guess_project())
+    it["tags"] = [t.lstrip("#") for t in (args.tag or [])]
+    it["due"] = parse_due(args.due) or None
+    if args.nudge:
+        it["nudge"] = args.nudge
+    for label in (args.need or []):
+        it["needs"].append(make_need(label))
+    if args.note:
+        note(it, args.note)
+    if args.sent:
+        it["state"] = "pending"
+        it["sent_at"] = iso(now())
+    data["items"].append(it)
+    save(data)
+    print(c(GREEN, "added ") + c(BOLD, it["id"]) + "  " + it["title"])
+    render([it])
+    return 0
+
+
+AUTO_TAG = "[auto]"
+
+
+def change_note(args) -> str:
+    """Note text for a state change, tagging anything the sweep decided.
+
+    Every automated decision carries its evidence, because an auto-mark that
+    turns out to be wrong is only recoverable if you can see what it believed.
+    """
+    manual = " ".join(getattr(args, "note", None) or []).strip()
+    evidence = (getattr(args, "auto", None) or "").strip()
+    if evidence:
+        return f"{AUTO_TAG} {evidence}" + (f" — {manual}" if manual else "")
+    return manual
+
+
+def _touch(it, state, stamp_field=None, text=None):
+    it["state"] = state
+    if text and text.startswith(AUTO_TAG):
+        it["last_auto"] = iso(now())
+    if stamp_field:
+        it[stamp_field] = iso(now())
+    if state in CLOSED_STATES:
+        it["closed_at"] = iso(now())
+    note(it, text or "")
+
+
+def cmd_sent(data, args):
+    it = find(data, args.id)
+    _touch(it, "pending", "sent_at", change_note(args))
+    save(data)
+    verb = "asked" if it["dir"] == "in" else "sent"
+    print(c(BLUE, f"{verb} ") + c(BOLD, it["id"]) + "  " + it["title"])
+    render([it])
+    return 0
+
+
+def cmd_chase(data, args):
+    it = find(data, args.id)
+    if it["state"] == "open":
+        # A chase on something never sent is really the first send.
+        it["sent_at"] = iso(now())
+    it["state"] = "pending"
+    it.setdefault("chases", []).append(iso(now()))
+    note(it, change_note(args))
+    save(data)
+    print(
+        c(YELLOW, "chased ")
+        + c(BOLD, it["id"])
+        + f"  ({len(it['chases'])}x)  "
+        + it["title"]
+    )
+    render([it])
+    return 0
+
+
+def cmd_got(data, args):
+    it = find(data, args.id)
+    _touch(it, "answered", "got_at", change_note(args))
+    save(data)
+    print(c(GREEN, "got it ") + c(BOLD, it["id"]) + "  " + it["title"])
+    render([it])
+    return 0
+
+
+def cmd_done(data, args):
+    it = find(data, args.id)
+    _touch(it, "done", None, change_note(args))
+    save(data)
+    print(c(DIM, "closed ") + c(BOLD, it["id"]) + "  " + it["title"])
+    return 0
+
+
+def cmd_block(data, args):
+    it = find(data, args.id)
+    _touch(it, "blocked", None, change_note(args))
+    save(data)
+    print(c(RED, "blocked ") + c(BOLD, it["id"]) + "  " + it["title"])
+    return 0
+
+
+def cmd_drop(data, args):
+    it = find(data, args.id)
+    _touch(it, "dropped", None, " ".join(args.note or []))
+    save(data)
+    print(c(DIM, "dropped ") + c(BOLD, it["id"]) + "  " + it["title"])
+    return 0
+
+
+def cmd_reopen(data, args):
+    it = find(data, args.id)
+    it["state"] = "pending" if it.get("sent_at") else "open"
+    it["closed_at"] = None
+    note(it, " ".join(args.note or []))
+    save(data)
+    print(c(YELLOW, "reopened ") + c(BOLD, it["id"]) + "  " + it["title"])
+    render([it])
+    return 0
+
+
+def cmd_note(data, args):
+    it = find(data, args.id)
+    text = " ".join(args.note).strip()
+    if not text:
+        die("nothing to note.")
+    note(it, text)
+    save(data)
+    print(c(DIM, "noted on ") + c(BOLD, it["id"]))
+    return 0
+
+
+def cmd_set(data, args):
+    it = find(data, args.id)
+    changed = []
+    for field in ("person", "channel", "task", "thread", "project", "title"):
+        val = getattr(args, field, None)
+        if val is not None:
+            it[field] = val.lstrip("#") if field == "task" else val
+            changed.append(field)
+    if args.due is not None:
+        it["due"] = parse_due(args.due) or None
+        changed.append("due")
+    if args.nudge is not None:
+        it["nudge"] = args.nudge
+        changed.append("nudge")
+    if args.tag:
+        it["tags"] = [t.lstrip("#") for t in args.tag]
+        changed.append("tags")
+    if args.dir is not None:
+        it["dir"] = args.dir
+        changed.append("dir")
+    if args.state is not None:
+        it["state"] = args.state
+        changed.append("state")
+    if not changed:
+        die("nothing to set.")
+    save(data)
+    print(c(GREEN, "updated ") + c(BOLD, it["id"]) + c(DIM, "  " + ", ".join(changed)))
+    render([it])
+    return 0
+
+
+def cmd_list(data, args):
+    items = select(data, args)
+    if args.json:
+        print(json.dumps([enrich(i) for i in items], indent=2, ensure_ascii=False))
+        return 0
+    if args.ids:
+        print("\n".join(i["id"] for i in items))
+        return 0
+
+    if args.flat:
+        render(items, show_notes=args.notes)
+    else:
+        groups = [
+            ("ON YOU", lambda i: (i["dir"] == "in" and i["state"] in ("open", "answered"))
+                or (i["dir"] == "out" and i["state"] in ("open", "pending"))),
+            ("WAITING ON THEM", lambda i: i["dir"] == "in" and i["state"] == "pending"),
+            ("BLOCKED", lambda i: i["state"] == "blocked"),
+            ("CLOSED", lambda i: i["state"] in CLOSED_STATES),
+        ]
+        shown = set()
+        for heading, pred in groups:
+            chunk = [i for i in items if pred(i) and i["id"] not in shown]
+            if not chunk:
+                continue
+            shown |= {i["id"] for i in chunk}
+            print()
+            print(c(BOLD, heading) + c(DIM, f"  ({len(chunk)})"))
+            render(chunk, show_notes=args.notes)
+    print()
+    print_summary(data)
+    return 0
+
+
+def cmd_show(data, args):
+    it = find(data, args.id)
+    e = enrich(it)
+    print()
+    render([it], show_notes=True)
+    if needs_of(it):
+        print()
+        render_needs(it)
+    print()
+    for k in ("created", "sent_at", "got_at", "closed_at", "last_contact", "thread"):
+        if e.get(k):
+            print(c(DIM, f"      {k:<13} {e[k]}"))
+    if e["chases"]:
+        print(c(DIM, f"      {'chases':<13} " + ", ".join(x[:16] for x in e["chases"])))
+    print()
+    return 0
+
+
+def cmd_who(data, args):
+    people = {}
+    for it in data["items"]:
+        if it["state"] in CLOSED_STATES:
+            continue
+        people.setdefault((it.get("person") or "—").lower(), []).append(it)
+    if not people:
+        print(c(DIM, "  nobody owes you anything. Suspicious."))
+        return 0
+    for person in sorted(people, key=lambda p: -len(people[p])):
+        chunk = people[person]
+        hot = sum(1 for i in chunk if attention(i))
+        head = c(BOLD, person) + c(DIM, f"  ({len(chunk)})")
+        if hot:
+            head += c(RED, f"  {hot} need action")
+        print()
+        print(head)
+        render(sorted(chunk, key=lambda i: (0 if attention(i) else 1, i["title"])))
+    print()
+    print_summary(data)
+    return 0
+
+
+def cmd_bar(data, args):
+    """Compact status for the bar / notifications / anything scripted."""
+    n = counts(data["items"])
+    if args.json:
+        print(json.dumps(n))
+        return 0
+    if n["live"] == 0:
+        print("")
+        return 0
+    out = f"{n['theirs']}/{n['mine']}"
+    if n["hot"]:
+        out += f" !{n['hot']}"
+    print(out)
+    return 0
+
+
+def cmd_sweep(data, args):
+    """Everything that wants checking, as JSON — the input to /ir-sweep."""
+    items = [
+        enrich(i)
+        for i in data["items"]
+        if i["state"] not in CLOSED_STATES and (args.all or attention(i))
+    ]
+    items.sort(key=lambda e: (e["attention"] is None, e["title"]))
+    print(
+        json.dumps(
+            {"generated": iso(now()), "counts": counts(data["items"]), "items": items},
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+BRIEF_RULES = """USE IT WITHOUT BEING ASKED:
+- He mentions needing something from someone, or says he'll ask -> ir add "<what>" --from <person> [--task <id>] [--due 3d]
+  If it is really several named pieces (host, user, password, ...), add them:
+  ir add "server access" --from tobias --need "FTP host" --need "FTP user" --need "DB password"
+- A piece of it arrived -> ir tick <id> "<piece>" --value "<what arrived>"
+  Partial deliveries are the normal case; tick what came and leave the rest.
+- Chasing? `ir chase-text <id>` drafts the "still outstanding" list to send.
+- He mentions owing someone something -> ir add "<what>" --owe --from <person> [--due 3d]
+- He sent the request / delivered the thing -> ir sent <id>
+- He nudged them again -> ir chase <id>
+- Information arrived (he pastes it, or you find a reply in Outlook/Slack/ClickUp) -> ir got <id> "<what arrived>"
+- It is finished -> ir done <id>
+BEFORE telling him to ask someone for something, run: ir list --grep <topic>
+He may have already asked, or they may have already answered.
+Depth: the `info-reminder` skill. Never hand-edit the JSON; always use the CLI."""
+
+
+def cmd_brief(data, args):
+    """The block injected into every Claude session, everywhere."""
+    live = [i for i in data["items"] if i["state"] not in CLOSED_STATES]
+    n = counts(data["items"])
+
+    print("<information-ledger>")
+    print(
+        "Klemen tracks every outstanding information request here: what he asked "
+        "for, what he owes, and what came back. Driven by the `ir` CLI (on PATH); "
+        f"state lives in {LEDGER}."
+    )
+    print()
+
+    if not live:
+        print("RIGHT NOW: nothing outstanding.")
+    else:
+        print(
+            f"RIGHT NOW: {n['theirs']} waiting on them, {n['mine']} on him, "
+            f"{n['hot']} need action."
+        )
+        hot = [i for i in live if attention(i)]
+        rest = [i for i in live if not attention(i)]
+        shown = (hot + rest)[: args.limit]
+        for it in shown:
+            e = enrich(it)
+            line = f"  {e['id']}  {e['title']}"
+            meta = [e["label"]]
+            if e["task"]:
+                meta.append(f"CU-{e['task']}")
+            if e["attention"]:
+                meta.append("!! " + e["attention"])
+            print(line + "  (" + " · ".join(meta) + ")")
+        if len(live) > len(shown):
+            print(f"  ... and {len(live) - len(shown)} more — run `ir list`")
+
+    print()
+    print(BRIEF_RULES)
+    print("</information-ledger>")
+    return 0
+
+
+def cmd_need(data, args):
+    """Add one or more named pieces to an item's checklist."""
+    it = find(data, args.id)
+    labels = [l.strip() for l in args.label if l.strip()]
+    if not labels:
+        die("name at least one thing you need.")
+    existing = {n["label"].lower() for n in needs_of(it)}
+    added = []
+    for label in labels:
+        if label.lower() in existing:
+            continue
+        it.setdefault("needs", []).append(make_need(label))
+        added.append(label)
+    sync_state_to_needs(it)
+    save(data)
+    if added:
+        print(c(GREEN, f"added {len(added)} to ") + c(BOLD, it["id"]) + "'s checklist")
+    else:
+        print(c(DIM, "already on the checklist"))
+    render_needs(it)
+    return 0
+
+
+def cmd_tick(data, args):
+    """Mark one piece of the checklist as received."""
+    it = find(data, args.id)
+    n = find_need(it, args.need)
+    n["got"] = True
+    n["at"] = iso(now())
+    n["value"] = (args.value or n.get("value") or "").strip()
+    n["auto"] = bool(args.auto)
+    if args.auto:
+        note(it, f"{AUTO_TAG} {args.auto}")
+        it["last_auto"] = iso(now())
+    was = it["state"]
+    sync_state_to_needs(it)
+    save(data)
+
+    print(c(GREEN, "got ") + c(BOLD, n["label"]) + c(DIM, f"  on {it['id']}"))
+    if it["state"] == "answered" and was != "answered":
+        print(c(GREEN, "  checklist complete — everything is in."))
+    render_needs(it)
+    return 0
+
+
+def cmd_untick(data, args):
+    it = find(data, args.id)
+    n = find_need(it, args.need)
+    n["got"] = False
+    n["at"] = None
+    n["auto"] = False
+    sync_state_to_needs(it)
+    save(data)
+    print(c(YELLOW, "outstanding again: ") + n["label"] + c(DIM, f"  on {it['id']}"))
+    render_needs(it)
+    return 0
+
+
+def cmd_missing(data, args):
+    """What is still outstanding, piece by piece — the chase list."""
+    if args.id:
+        items = [find(data, args.id)]
+    else:
+        items = [
+            i for i in data["items"]
+            if i["state"] not in CLOSED_STATES and needs_missing(i)
+        ]
+        items.sort(key=lambda i: (0 if attention(i) else 1, i["title"].lower()))
+
+    if args.json:
+        print(json.dumps(
+            [{"id": i["id"], "title": i["title"], "person": i.get("person", ""),
+              "missing": [n["label"] for n in needs_missing(i)],
+              "got": [n["label"] for n in needs_got(i)]}
+             for i in items], indent=2, ensure_ascii=False))
+        return 0
+
+    if not items:
+        print(c(DIM, "  nothing part-delivered."))
+        return 0
+
+    for it in items:
+        print()
+        print(f"  {state_mark(it)} {c(BOLD, it['id'])}  {it['title']}"
+              + c(DIM, f"  · {it.get('person') or '—'}"))
+        render_needs(it, indent=6)
+    print()
+    return 0
+
+
+def cmd_chase_text(data, args):
+    """Draft the 'still missing' paragraph to paste into a mail or comment."""
+    it = find(data, args.id)
+    missing = needs_missing(it)
+    if not needs_of(it):
+        print(f"Following up on: {it['title']}")
+        return 0
+    if not missing:
+        print(c(DIM, "  nothing missing — everything on the checklist is in."))
+        return 0
+
+    got = needs_got(it)
+    lines = []
+    if got:
+        lines.append(f"Thanks for {_join_labels([n['label'] for n in got])}.")
+        lines.append("")
+        lines.append("Still outstanding:")
+    else:
+        lines.append(f"Following up on {it['title']} — I still need:")
+        lines.append("")
+    for n in missing:
+        lines.append(f"  - {n['label']}")
+    print("\n".join(lines))
+    return 0
+
+
+def _join_labels(labels: list) -> str:
+    if len(labels) == 1:
+        return labels[0]
+    return ", ".join(labels[:-1]) + " and " + labels[-1]
+
+
+def render_needs(item: dict, indent: int = 6) -> None:
+    needs = needs_of(item)
+    if not needs:
+        return
+    pad = " " * indent
+    for i, n in enumerate(needs, 1):
+        box = c(GREEN, "[x]") if n.get("got") else c(YELLOW, "[ ]")
+        line = f"{pad}{box} {i}. {n['label']}"
+        extra = []
+        if n.get("value"):
+            extra.append(n["value"])
+        if n.get("auto"):
+            extra.append("auto")
+        if extra:
+            line += c(DIM, "  — " + " · ".join(extra))
+        print(line)
+
+
+def cmd_audit(data, args):
+    """Everything the background sweep decided, so a bad call is catchable."""
+    cutoff = None
+    if args.since:
+        m = REL.match(args.since.strip())
+        if m:
+            days = {"d": 1, "w": 7, "m": 30}[m.group(2).lower()] * int(m.group(1))
+            cutoff = now() - timedelta(days=days)
+        else:
+            cutoff = parse_dt(args.since)
+            if not cutoff:
+                die(f"can't read {args.since!r} as a time. Try 1d, 2w or an ISO timestamp.")
+
+    found = []
+    for it in data["items"]:
+        for n in it.get("notes", []):
+            if not n["text"].startswith(AUTO_TAG):
+                continue
+            at = parse_dt(n["at"])
+            if cutoff and (not at or at < cutoff):
+                continue
+            found.append((at, it, n))
+    found.sort(key=lambda r: r[0] or now())
+
+    if args.json:
+        print(json.dumps(
+            [{"id": it["id"], "title": it["title"], "state": it["state"],
+              "at": n["at"], "evidence": n["text"][len(AUTO_TAG):].strip()}
+             for _, it, n in found],
+            indent=2, ensure_ascii=False))
+        return 0
+
+    if not found:
+        print(c(DIM, "  the sweep has not decided anything in this window."))
+        return 0
+
+    print()
+    print(c(BOLD, "AUTOMATED CHANGES") + c(DIM, f"  ({len(found)})"))
+    for at, it, n in found:
+        print(f"  {state_mark(it)} {c(BOLD, it['id'])}  {it['title']}")
+        print("      " + c(CYAN, label(it)) + c(DIM, f"  ·  {(n['at'] or '')[:16]}"))
+        print("      " + c(DIM, n["text"][len(AUTO_TAG):].strip()))
+    print()
+    print(c(DIM, "  wrong? `ir reopen <id>` puts it back."))
+    return 0
+
+
+def cmd_path(data, args):
+    print(LEDGER)
+    return 0
+
+
+def cmd_tui(data, args):
+    from ir_tui import run  # noqa: F401  (resolved via sys.path shim below)
+
+    return run(LEDGER)
+
+
+# ---------------------------------------------------------------- cli
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="ir",
+        description="The information ledger: what you asked for, what you owe, what came back.",
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    def note_arg(sp):
+        sp.add_argument("note", nargs="*", help="optional note recorded with the change")
+
+    def auto_arg(sp):
+        sp.add_argument("--auto", metavar="EVIDENCE",
+                        help="the sweep decided this; record what it saw")
+
+    a = sub.add_parser("add", help="add an item")
+    a.add_argument("title", nargs="+")
+    a.add_argument("--from", "--person", "-p", dest="person", help="who it involves")
+    a.add_argument("--owe", "-o", action="store_true", help="you owe them (default: they owe you)")
+    a.add_argument("--channel", "-c", help="email|clickup|slack|teams|call")
+    a.add_argument("--task", "-t", help="ClickUp task id")
+    a.add_argument("--thread", help="mail message-id, slack permalink or url")
+    a.add_argument("--project", help="project name (default: current repo)")
+    a.add_argument("--tag", action="append")
+    a.add_argument("--due", "-d", help="3d, 2w, fri, tomorrow or 2026-10-05")
+    a.add_argument("--nudge", type=int, help=f"days of silence before chasing (default {DEFAULT_NUDGE})")
+    a.add_argument("--note", "-n", help="opening note")
+    a.add_argument("--need", action="append", metavar="THING",
+                   help="a named piece this item is made of; repeatable")
+    a.add_argument("--sent", action="store_true", help="it has already gone out")
+    a.set_defaults(fn=cmd_add)
+
+    s = sub.add_parser("sent", aliases=["ask", "asked"], help="the request or deliverable went out")
+    s.add_argument("id")
+    note_arg(s)
+    auto_arg(s)
+    s.set_defaults(fn=cmd_sent)
+
+    ch = sub.add_parser("chase", aliases=["nudge", "poke"], help="record a nudge")
+    ch.add_argument("id")
+    note_arg(ch)
+    auto_arg(ch)
+    ch.set_defaults(fn=cmd_chase)
+
+    g = sub.add_parser("got", aliases=["received"], help="the answer came back")
+    g.add_argument("id")
+    note_arg(g)
+    auto_arg(g)
+    g.set_defaults(fn=cmd_got)
+
+    for name, fn, helptext in (
+        ("done", cmd_done, "close it"),
+        ("block", cmd_block, "mark blocked"),
+        ("drop", cmd_drop, "abandon, keep the record"),
+        ("reopen", cmd_reopen, "bring it back"),
+    ):
+        sp = sub.add_parser(name, help=helptext)
+        sp.add_argument("id")
+        note_arg(sp)
+        auto_arg(sp)
+        sp.set_defaults(fn=fn)
+
+    n = sub.add_parser("note", help="append a note")
+    n.add_argument("id")
+    n.add_argument("note", nargs="+")
+    n.set_defaults(fn=cmd_note)
+
+    st = sub.add_parser("set", help="edit fields")
+    st.add_argument("id")
+    st.add_argument("--title")
+    st.add_argument("--from", "--person", "-p", dest="person")
+    st.add_argument("--channel", "-c")
+    st.add_argument("--task", "-t")
+    st.add_argument("--thread")
+    st.add_argument("--project")
+    st.add_argument("--tag", action="append")
+    st.add_argument("--due", "-d")
+    st.add_argument("--nudge", type=int)
+    st.add_argument("--dir", choices=DIRS)
+    st.add_argument("--state", choices=STATES)
+    st.set_defaults(fn=cmd_set)
+
+    ls = sub.add_parser("list", aliases=["ls"], help="the board")
+    ls.add_argument("--all", "-a", action="store_true", help="include closed")
+    ls.add_argument("--state", choices=STATES)
+    ls.add_argument("--from", "--person", "-p", dest="person")
+    ls.add_argument("--dir", choices=DIRS)
+    ls.add_argument("--tag")
+    ls.add_argument("--project")
+    ls.add_argument("--task", "-t")
+    ls.add_argument("--hot", action="store_true", help="only what needs action")
+    ls.add_argument("--grep", "-g")
+    ls.add_argument("--notes", action="store_true", help="show notes")
+    ls.add_argument("--flat", action="store_true", help="no grouping")
+    ls.add_argument("--json", action="store_true")
+    ls.add_argument("--ids", action="store_true", help="ids only")
+    ls.set_defaults(fn=cmd_list)
+
+    sh = sub.add_parser("show", help="one item in full")
+    sh.add_argument("id")
+    sh.set_defaults(fn=cmd_show)
+
+    w = sub.add_parser("who", help="group everything live by person")
+    w.set_defaults(fn=cmd_who)
+
+    b = sub.add_parser("bar", help="compact counts for the bar")
+    b.add_argument("--json", action="store_true")
+    b.set_defaults(fn=cmd_bar)
+
+    sw = sub.add_parser("sweep", help="what needs checking, as JSON (for Claude)")
+    sw.add_argument("--all", action="store_true", help="every live item, not just hot ones")
+    sw.set_defaults(fn=cmd_sweep)
+
+    nd = sub.add_parser("need", help="add named pieces to an item's checklist")
+    nd.add_argument("id")
+    nd.add_argument("label", nargs="+")
+    nd.set_defaults(fn=cmd_need)
+
+    tk = sub.add_parser("tick", aliases=["have"], help="mark one checklist piece received")
+    tk.add_argument("id")
+    tk.add_argument("need", help="its number, or part of its label")
+    tk.add_argument("--value", "-v", help="what actually arrived")
+    tk.add_argument("--auto", metavar="EVIDENCE", help="the sweep decided this")
+    tk.set_defaults(fn=cmd_tick)
+
+    ut = sub.add_parser("untick", help="mark one checklist piece outstanding again")
+    ut.add_argument("id")
+    ut.add_argument("need")
+    ut.set_defaults(fn=cmd_untick)
+
+    ms = sub.add_parser("missing", help="what is still outstanding, piece by piece")
+    ms.add_argument("id", nargs="?")
+    ms.add_argument("--json", action="store_true")
+    ms.set_defaults(fn=cmd_missing)
+
+    ct = sub.add_parser("chase-text", help="draft the 'still missing' text to send")
+    ct.add_argument("id")
+    ct.set_defaults(fn=cmd_chase_text)
+
+    au = sub.add_parser("audit", help="what the background sweep decided")
+    au.add_argument("--since", default="2d", help="1d, 2w or an ISO timestamp (default 2d)")
+    au.add_argument("--json", action="store_true")
+    au.set_defaults(fn=cmd_audit)
+
+    br = sub.add_parser("brief", help="context block for Claude sessions")
+    br.add_argument("--limit", type=int, default=8, help="max items listed")
+    br.set_defaults(fn=cmd_brief)
+
+    sub.add_parser("path", help="print the ledger path").set_defaults(fn=cmd_path)
+
+    t = sub.add_parser("tui", help="full-screen board")
+    t.set_defaults(fn=cmd_tui)
+
+    return p
+
+
+def main(argv=None) -> int:
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "fn", None):
+        data = load()
+        args = parser.parse_args(["list"])
+        return args.fn(data, args)
+    return args.fn(load(), args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

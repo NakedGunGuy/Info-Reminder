@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the information ledger sweep hourly during working hours
+
+[Timer]
+# Hourly, 07:00–19:00 on weekdays. Overnight and weekend runs would only burn
+# API calls on a mailbox nobody is writing to. Widen with `systemctl --user edit`.
+OnCalendar=Mon-Fri 07..19:00
+# Catch up after the laptop was asleep at the top of the hour.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

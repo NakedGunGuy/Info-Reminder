@@ -1,0 +1,10 @@
+[Unit]
+Description=Information ledger sweep — reconcile the ledger against mail, ClickUp and Slack
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/dev/projects/info-reminder/claude/sweep/run-sweep.sh
+# The sweep reads pass, which needs the gpg agent; inheriting the user session
+# environment is what lets it decrypt without an interactive prompt.
+Environment=GPG_TTY=
