@@ -119,11 +119,11 @@ it in a clause.
 | "that's sorted" | `ir done <id>` |
 | he pastes a BugHerd link | `ir add ... --thread <url>` (or `ir set <id> --thread <url>`) |
 
-**BugHerd is per-project** — some clients use it, some don't. There is no
-BugHerd MCP and no API key stored, so the only visibility is the notification
-mail in Klemen's own Outlook, and the task URL he gives you. Keep the URL on the
-item's `thread`: the task number in it (`/tasks/140` → `#140`) is what makes the
-notification mail findable later.
+**BugHerd is deliberately out of the sweep.** It is per-project, there is no MCP
+and no API key, and notification mail only proves a task was raised — never that
+it is still open. So the sweep ignores it entirely. When Klemen brings a BugHerd
+task up in conversation, handle it there: if it is worth tracking, put the URL on
+the item's `thread`. Do not go hunting for BugHerd mail unprompted.
 
 **Read from it before you give advice.** Before suggesting he ask anyone for
 anything, run `ir list --grep <topic>`. If there is already a `pending` item,
