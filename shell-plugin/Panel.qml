@@ -233,7 +233,11 @@ Panel {
 
         Text {
           width: parent.width
-          text: (entry.mark || "") + "  " + (entry.title || "")
+          // Project leads the line: with several clients in the ledger it is the
+          // first thing you need to place an item, not a trailing detail.
+          text: (entry.mark || "") + "  "
+                + (entry.project ? "[" + entry.project + "] " : "")
+                + (entry.title || "")
           color: Color.popups.text
           font.family: Style.font.family
           font.pixelSize: Style.font.body

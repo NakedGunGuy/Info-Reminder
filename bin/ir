@@ -417,15 +417,16 @@ def state_mark(item: dict) -> str:
     }[item["state"]]
 
 
-def render(items: list[dict], show_notes: bool = False) -> None:
+def render(items: list[dict], show_notes: bool = False, show_project: bool = True) -> None:
     if not items:
         print(c(DIM, "  nothing here."))
         return
     width = shutil.get_terminal_size((100, 24)).columns
     for it in items:
         e = enrich(it)
-        head = f"  {state_mark(it)} {c(BOLD, e['id'])}  {e['title']}"
-        print(head[: width + 40])
+        badge = c(MAGENTA, f"[{e['project']}] ") if (show_project and e.get("project")) else ""
+        head = f"  {state_mark(it)} {c(BOLD, e['id'])}  {badge}{e['title']}"
+        print(head[: width + 80])
 
         bits = [c(CYAN, e["label"])]
         if e["chase_count"]:
@@ -435,11 +436,9 @@ def render(items: list[dict], show_notes: bool = False) -> None:
         if e["due"]:
             bits.append(f"due {e['due']}")
         if e["task"]:
-            bits.append(c(MAGENTA, f"CU-{e['task']}"))
+            bits.append(f"CU-{e['task']}")
         if e["channel"]:
             bits.append(e["channel"])
-        if e["project"]:
-            bits.append(c(DIM, e["project"]))
         if e["tags"]:
             bits.append(c(DIM, " ".join("#" + t for t in e["tags"])))
         print("      " + c(DIM, " · ".join(bits)))
@@ -729,7 +728,20 @@ def cmd_list(data, args):
         print("\n".join(i["id"] for i in items))
         return 0
 
-    if args.flat:
+    if args.by == "project":
+        groups = {}
+        for i in items:
+            groups.setdefault(i.get("project") or "(no project)", []).append(i)
+        for name in sorted(groups, key=lambda n: (n == "(no project)", n.lower())):
+            chunk = groups[name]
+            hot = sum(1 for i in chunk if attention(i))
+            head = c(BOLD, name.upper()) + c(DIM, f"  ({len(chunk)})")
+            if hot:
+                head += c(RED, f"  {hot} need action")
+            print()
+            print(head)
+            render(chunk, show_notes=args.notes, show_project=False)
+    elif args.flat:
         render(items, show_notes=args.notes)
     else:
         groups = [
@@ -1212,6 +1224,7 @@ def build_parser() -> argparse.ArgumentParser:
     ls.add_argument("--grep", "-g")
     ls.add_argument("--notes", action="store_true", help="show notes")
     ls.add_argument("--flat", action="store_true", help="no grouping")
+    ls.add_argument("--by", choices=["project"], help="group by project instead of by who has the ball")
     ls.add_argument("--json", action="store_true")
     ls.add_argument("--ids", action="store_true", help="ids only")
     ls.set_defaults(fn=cmd_list)

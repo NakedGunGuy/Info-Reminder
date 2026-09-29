@@ -51,6 +51,12 @@ sudo pacman -S thunderbird
 editing the installed thing. The QML hot-reloads on save; the CLI has no build
 step.
 
+**Editing the bar plugin:** `install.sh` symlinks `shell-plugin/` into
+`~/.config/omarchy/plugins/`, and the shell's file watcher does not follow the
+symlink — so QML edits do **not** hot-reload the way they do for a real
+directory there. Run `omarchy restart shell` after changing `Panel.qml` or
+`Model.js`; `omarchy-shell shell rescanPlugins` is not enough.
+
 ## The model
 
 | Field | Meaning |

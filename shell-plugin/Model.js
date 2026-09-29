@@ -226,17 +226,17 @@ function actions(row) {
   var CLOSE = "\uf058"    // check-circle
   var REDO = "\uf021"     // refresh
 
-  if (row.state === "blocked") return [{ key: "reopen", icon: REDO, tip: "Unblock" }]
+  if (row.state === "blocked") return [{ key: "reopen", icon: REDO, tip: "No longer blocked" }]
   if (row.dir === "in") {
-    if (row.state === "open") return [{ key: "sent", icon: SEND, tip: "Mark asked" }]
+    if (row.state === "open") return [{ key: "sent", icon: SEND, tip: "I asked them" }]
     if (row.state === "pending") return [
-      { key: "chase", icon: BELL, tip: "Record a nudge" },
-      { key: "got", icon: CHECK, tip: "Answer received" }
+      { key: "chase", icon: BELL, tip: "I followed up again" },
+      { key: "got", icon: CHECK, tip: "They gave me the info" }
     ]
-    if (row.state === "answered") return [{ key: "done", icon: CLOSE, tip: "Close it" }]
+    if (row.state === "answered") return [{ key: "done", icon: CLOSE, tip: "Done — close it" }]
   } else {
-    if (row.state === "open") return [{ key: "sent", icon: SEND, tip: "Mark sent" }]
-    return [{ key: "done", icon: CLOSE, tip: "Close it" }]
+    if (row.state === "open") return [{ key: "sent", icon: SEND, tip: "I sent it" }]
+    return [{ key: "done", icon: CLOSE, tip: "Done — close it" }]
   }
   return []
 }

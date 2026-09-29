@@ -154,7 +154,8 @@ def draw(stdscr, board: Board):
             "blocked": 1, "done": 5, "dropped": 5,
         }[row["state"]])
 
-        head = f" {MARK[row['state']]} {row['id']}  {row['title']}"
+        badge = f"[{row['project']}] " if row.get("project") else ""
+        head = f" {MARK[row['state']]} {row['id']}  {badge}{row['title']}"
         stdscr.addstr(y, 0, head[: w - 1].ljust(w - 1) if selected else head[: w - 1],
                       attr | (0 if selected else colour))
 
