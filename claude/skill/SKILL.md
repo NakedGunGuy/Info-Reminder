@@ -138,6 +138,10 @@ answer that already arrived and that he missed:
      connector CANNOT read `support@movepeople.ch`; do not try.
    - `outlook_email_search` for Klemen's own mailbox
    - `clickup_get_task_comments` when the item carries a `task`
+   - **BugHerd** notifications arrive in Klemen's own Outlook (not support@):
+     `outlook_email_search` with `sender: bugherd.com`. The status in the mail is
+     a snapshot from when it was sent, not the current state — good evidence
+     something was raised, poor evidence it is still open.
    - `slack_search_public_and_private` / `teams_list_chats` for a DM reply
 3. Tick what you can evidence, piece by piece, recording where you saw it:
    `ir tick <id> "<piece>" --value "<what arrived>" --auto "<sender, date, quote>"`
