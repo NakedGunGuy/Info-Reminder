@@ -45,6 +45,11 @@ search terms. Check the sources that make sense for that item:
   task number and project, e.g. "Task assigned to you [#25] on the Silver Monkey
   project"; the body opens with the status at the time it was sent.
 
+  When the item's `thread` is a BugHerd URL, take the task number out of it
+  (`.../projects/472312/tasks/140` → `#140`) and search for that number — it is
+  what ties the item to its notification mail. BugHerd is per-project, so most
+  items will have no BugHerd trail at all; that is normal, not a miss.
+
   Treat that status as a SNAPSHOT, never as current. A task assigned on the 10th
   and closed on the 11th still has an "assigned" mail sitting in the inbox. So a
   BugHerd mail is good evidence that something was raised or commented on, and

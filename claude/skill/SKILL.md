@@ -117,6 +117,13 @@ it in a clause.
 | "Tobias sent the creds" / he pastes them | `ir got <id> "<what arrived>"` |
 | "I still owe Dani the specs" | `ir add "specs" --owe --from dani` |
 | "that's sorted" | `ir done <id>` |
+| he pastes a BugHerd link | `ir add ... --thread <url>` (or `ir set <id> --thread <url>`) |
+
+**BugHerd is per-project** — some clients use it, some don't. There is no
+BugHerd MCP and no API key stored, so the only visibility is the notification
+mail in Klemen's own Outlook, and the task URL he gives you. Keep the URL on the
+item's `thread`: the task number in it (`/tasks/140` → `#140`) is what makes the
+notification mail findable later.
 
 **Read from it before you give advice.** Before suggesting he ask anyone for
 anything, run `ir list --grep <topic>`. If there is already a `pending` item,
