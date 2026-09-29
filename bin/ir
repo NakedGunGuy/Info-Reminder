@@ -944,6 +944,20 @@ def cmd_untick(data, args):
     return 0
 
 
+def cmd_unchase(data, args):
+    """Drop the most recent nudge — recorded one against the wrong item."""
+    it = find(data, args.id)
+    chases = it.get("chases") or []
+    if not chases:
+        die(f"{it['id']} has no recorded nudges.")
+    dropped = chases.pop()
+    save(data)
+    print(c(DIM, "removed nudge ") + (dropped or "")[:16] + c(DIM, f" from {it['id']}")
+          + c(DIM, f"  ({len(chases)} left)"))
+    render([it])
+    return 0
+
+
 def cmd_unneed(data, args):
     """Drop a checklist entry that turned out to be wrong or already settled."""
     it = find(data, args.id)
@@ -1233,6 +1247,10 @@ def build_parser() -> argparse.ArgumentParser:
     ut.add_argument("id")
     ut.add_argument("need")
     ut.set_defaults(fn=cmd_untick)
+
+    uc = sub.add_parser("unchase", help="remove the most recent nudge")
+    uc.add_argument("id")
+    uc.set_defaults(fn=cmd_unchase)
 
     un = sub.add_parser("unneed", help="remove a checklist entry")
     un.add_argument("id")
