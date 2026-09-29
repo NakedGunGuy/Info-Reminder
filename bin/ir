@@ -571,12 +571,35 @@ def change_note(args) -> str:
     return manual
 
 
-def _touch(it, state, stamp_field=None, text=None):
+def stamp_from(args) -> str:
+    """When the change actually happened — `--at` for bootstrapping from history.
+
+    Without this, importing a request you sent three weeks ago records it as
+    sent today, and the silence tracking (the whole point) reads zero.
+    """
+    raw = getattr(args, "at", None)
+    if not raw:
+        return iso(now())
+    m = REL.match(raw.strip())
+    if m:
+        days = {"d": 1, "w": 7, "m": 30}[m.group(2).lower()] * int(m.group(1))
+        return iso(now() - timedelta(days=days))
+    dt = parse_dt(raw)
+    if not dt:
+        try:
+            dt = datetime.combine(date.fromisoformat(raw.strip()),
+                                  datetime.min.time()).astimezone()
+        except ValueError:
+            die(f"can't read {raw!r} as a date. Try 3d, 2w or 2026-09-11.")
+    return iso(dt)
+
+
+def _touch(it, state, stamp_field=None, text=None, when=None):
     it["state"] = state
     if text and text.startswith(AUTO_TAG):
         it["last_auto"] = iso(now())
     if stamp_field:
-        it[stamp_field] = iso(now())
+        it[stamp_field] = when or iso(now())
     if state in CLOSED_STATES:
         it["closed_at"] = iso(now())
     note(it, text or "")
@@ -584,7 +607,7 @@ def _touch(it, state, stamp_field=None, text=None):
 
 def cmd_sent(data, args):
     it = find(data, args.id)
-    _touch(it, "pending", "sent_at", change_note(args))
+    _touch(it, "pending", "sent_at", change_note(args), stamp_from(args))
     save(data)
     verb = "asked" if it["dir"] == "in" else "sent"
     print(c(BLUE, f"{verb} ") + c(BOLD, it["id"]) + "  " + it["title"])
@@ -598,7 +621,7 @@ def cmd_chase(data, args):
         # A chase on something never sent is really the first send.
         it["sent_at"] = iso(now())
     it["state"] = "pending"
-    it.setdefault("chases", []).append(iso(now()))
+    it.setdefault("chases", []).append(stamp_from(args))
     note(it, change_note(args))
     save(data)
     print(
@@ -613,7 +636,7 @@ def cmd_chase(data, args):
 
 def cmd_got(data, args):
     it = find(data, args.id)
-    _touch(it, "answered", "got_at", change_note(args))
+    _touch(it, "answered", "got_at", change_note(args), stamp_from(args))
     save(data)
     print(c(GREEN, "got it ") + c(BOLD, it["id"]) + "  " + it["title"])
     render([it])
@@ -1073,6 +1096,10 @@ def build_parser() -> argparse.ArgumentParser:
     def note_arg(sp):
         sp.add_argument("note", nargs="*", help="optional note recorded with the change")
 
+    def at_arg(sp):
+        sp.add_argument("--at", metavar="WHEN",
+                        help="when it actually happened: 3d, 2w or 2026-09-11")
+
     def auto_arg(sp):
         sp.add_argument("--auto", metavar="EVIDENCE",
                         help="the sweep decided this; record what it saw")
@@ -1098,18 +1125,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("id")
     note_arg(s)
     auto_arg(s)
+    at_arg(s)
     s.set_defaults(fn=cmd_sent)
 
     ch = sub.add_parser("chase", aliases=["nudge", "poke"], help="record a nudge")
     ch.add_argument("id")
     note_arg(ch)
     auto_arg(ch)
+    at_arg(ch)
     ch.set_defaults(fn=cmd_chase)
 
     g = sub.add_parser("got", aliases=["received"], help="the answer came back")
     g.add_argument("id")
     note_arg(g)
     auto_arg(g)
+    at_arg(g)
     g.set_defaults(fn=cmd_got)
 
     for name, fn, helptext in (
