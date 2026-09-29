@@ -944,6 +944,18 @@ def cmd_untick(data, args):
     return 0
 
 
+def cmd_unneed(data, args):
+    """Drop a checklist entry that turned out to be wrong or already settled."""
+    it = find(data, args.id)
+    n = find_need(it, args.need)
+    it["needs"] = [x for x in needs_of(it) if x is not n]
+    sync_state_to_needs(it)
+    save(data)
+    print(c(DIM, "removed from checklist: ") + n["label"] + c(DIM, f"  on {it['id']}"))
+    render_needs(it)
+    return 0
+
+
 def cmd_missing(data, args):
     """What is still outstanding, piece by piece — the chase list."""
     if args.id:
@@ -1221,6 +1233,11 @@ def build_parser() -> argparse.ArgumentParser:
     ut.add_argument("id")
     ut.add_argument("need")
     ut.set_defaults(fn=cmd_untick)
+
+    un = sub.add_parser("unneed", help="remove a checklist entry")
+    un.add_argument("id")
+    un.add_argument("need")
+    un.set_defaults(fn=cmd_unneed)
 
     ms = sub.add_parser("missing", help="what is still outstanding, piece by piece")
     ms.add_argument("id", nargs="?")
