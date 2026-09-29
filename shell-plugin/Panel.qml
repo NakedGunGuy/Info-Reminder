@@ -19,6 +19,10 @@ Panel {
   readonly property string ledgerPath: Quickshell.env("HOME") + "/.local/share/info-reminder/ledger.json"
   readonly property string irBin: Quickshell.env("HOME") + "/.local/bin/ir"
 
+  // How much of the list is shown before it scrolls. Used both to clip the list
+  // and to size the panel, which must agree or the popup grows past its content.
+  readonly property real listCap: Style.space(620)
+
   property var items: []
   readonly property var stats: Model.counts(root.items)
   readonly property var rows: Model.flatten(Model.groups(root.items))
@@ -87,8 +91,15 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(430))
-    contentHeight: panel.fittedContentHeight(header.implicitHeight + list.contentHeight + footer.implicitHeight + Style.space(28))
+    // Wide enough that titles and the "still need:" line stop eliding — this is
+    // a reading surface, not a pill. fittedContentWidth clamps to the screen.
+    contentWidth: panel.fittedContentWidth(Style.space(760))
+    // Must use the CAPPED list height, not contentHeight: the list clips at
+    // listCap, so sizing the panel to the full content grew it to fit rows it
+    // then refused to show, leaving a large empty band under the footer.
+    contentHeight: panel.fittedContentHeight(
+      header.implicitHeight + Math.min(list.contentHeight, root.listCap)
+      + footer.implicitHeight + Style.space(28))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -137,7 +148,7 @@ Panel {
         ListView {
           id: list
           width: parent.width
-          height: Math.min(contentHeight, Style.space(420))
+          height: Math.min(contentHeight, root.listCap)
           clip: true
           spacing: Style.space(2)
           boundsBehavior: Flickable.StopAtBounds
